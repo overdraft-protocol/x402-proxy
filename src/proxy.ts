@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import express from "express";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
 import { ExactEvmScheme, toClientEvmSigner } from "@x402/evm";
@@ -62,11 +63,19 @@ app.use(async (req, res, next) => {
       res.setHeader(key, value);
     });
 
-    if (!upstreamRes.body) return res.end();
-    Readable.fromWeb(upstreamRes.body as never).pipe(res);
+    if (!upstreamRes.body) {
+      res.end();
+      return;
+    }
+    const body = Readable.fromWeb(upstreamRes.body as never);
+    await pipeline(body, res);
   } catch (err) {
     console.error("proxy error:", err);
-    res.status(502).json({ error: (err as Error).message });
+    if (!res.headersSent) {
+      res.status(502).json({ error: (err as Error).message });
+    } else if (!res.writableEnded) {
+      res.destroy(err as Error);
+    }
   }
 });
 
