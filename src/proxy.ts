@@ -41,6 +41,41 @@ app.use(express.json({ limit: "10mb" }));
 
 const PROXIED_PREFIXES = ["/v1/", "/health", "/.well-known/"];
 
+/** Upstream (tx402 / CDN) dropped the connection while fetch was reading the body. */
+function isUndiciUpstreamSocketClose(err: unknown): boolean {
+  if (!(err instanceof TypeError) || err.message !== "terminated") return false;
+  const cause = (err as Error & { cause?: { code?: string } }).cause;
+  return cause?.code === "UND_ERR_SOCKET";
+}
+
+/** Client disconnected from the proxy before the full body was written (timeouts, abort, agent cancel). */
+function isClientDisconnectedPrematureClose(err: unknown): boolean {
+  const code = err && typeof err === "object" && "code" in err ? (err as { code?: string }).code : "";
+  if (code !== "ERR_STREAM_PREMATURE_CLOSE") return false;
+  const stack = err instanceof Error ? err.stack ?? "" : "";
+  return stack.includes("onServerResponseClose");
+}
+
+function logProxyFailure(err: unknown, upstreamUrl: string, clientLabel: string): void {
+  if (isUndiciUpstreamSocketClose(err)) {
+    console.warn(
+      "upstream closed TLS socket mid-request (CDN timeout, reset, or server close). Not your agent:",
+      upstreamUrl,
+    );
+    return;
+  }
+  if (isClientDisconnectedPrematureClose(err)) {
+    console.warn("client disconnected before response finished:", clientLabel);
+    return;
+  }
+  const code = err && typeof err === "object" && "code" in err ? String((err as { code?: string }).code) : "";
+  if (code === "ERR_STREAM_PREMATURE_CLOSE") {
+    console.warn("stream closed before response finished:", upstreamUrl);
+    return;
+  }
+  console.error("proxy error:", err);
+}
+
 app.use(async (req, res, next) => {
   if (!PROXIED_PREFIXES.some((p) => req.path === p.replace(/\/$/, "") || req.path.startsWith(p))) {
     return next();
@@ -70,7 +105,8 @@ app.use(async (req, res, next) => {
     const body = Readable.fromWeb(upstreamRes.body as never);
     await pipeline(body, res);
   } catch (err) {
-    console.error("proxy error:", err);
+    const clientLabel = `${req.method} ${req.originalUrl} ← ${req.socket.remoteAddress ?? "?"}`;
+    logProxyFailure(err, upstreamUrl, clientLabel);
     if (!res.headersSent) {
       res.status(502).json({ error: (err as Error).message });
     } else if (!res.writableEnded) {
